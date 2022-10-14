@@ -1,20 +1,8 @@
 // @flow
 
-import { invariant } from '../utils/common'
 import type { Database, RecordId, TableName, Model } from '..'
 import { type DirtyRaw } from '../RawRecord'
 
-import {
-  applyRemoteChanges,
-  fetchLocalChanges,
-  markLocalChangesAsSynced,
-  getLastPulledAt,
-  setLastPulledAt,
-  setLastPulledSchemaVersion,
-  hasUnsyncedChanges as hasUnsyncedChangesImpl,
-  getMigrationInfo,
-} from './impl'
-import { ensureActionsEnabled, ensureSameDatabase, isChangeSetEmpty } from './impl/helpers'
 import type { SchemaVersion } from '../Schema'
 import { type MigrationSyncChanges } from '../Schema/migrations/getSyncChanges'
 
@@ -25,7 +13,7 @@ export type SyncTableChangeSet = $Exact<{
   updated: DirtyRaw[],
   deleted: RecordId[],
 }>
-export type SyncDatabaseChangeSet = $Exact<{ [TableName<any>]: SyncTableChangeSet }>
+export type SyncDatabaseChangeSet = { [TableName<any>]: SyncTableChangeSet }
 
 export type SyncLocalChanges = $Exact<{ changes: SyncDatabaseChangeSet, affectedRecords: Model[] }>
 
@@ -34,9 +22,16 @@ export type SyncPullArgs = $Exact<{
   schemaVersion: SchemaVersion,
   migration: MigrationSyncChanges,
 }>
-export type SyncPullResult = $Exact<{ changes: SyncDatabaseChangeSet, timestamp: Timestamp }>
+export type SyncPullResult =
+  | $Exact<{ changes: SyncDatabaseChangeSet, timestamp: Timestamp }>
+  | $Exact<{ syncJson: string }>
+  | $Exact<{ syncJsonId: number }>
+
+export type SyncRejectedIds = { [TableName<any>]: RecordId[] }
 
 export type SyncPushArgs = $Exact<{ changes: SyncDatabaseChangeSet, lastPulledAt: Timestamp }>
+
+export type SyncPushResult = $Exact<{ experimentalRejectedIds?: SyncRejectedIds }>
 
 type SyncConflict = $Exact<{ local: DirtyRaw, remote: DirtyRaw, resolved: DirtyRaw }>
 export type SyncLog = {
@@ -46,7 +41,12 @@ export type SyncLog = {
   migration?: ?MigrationSyncChanges,
   newLastPulledAt?: number,
   resolvedConflicts?: SyncConflict[],
+  rejectedIds?: SyncRejectedIds,
   finishedAt?: Date,
+  remoteChangeCount?: number,
+  localChangeCount?: number,
+  phase?: string, // NOTE: an textual information, not a stable API!
+  error?: Error,
 }
 
 export type SyncConflictResolver = (
@@ -58,8 +58,8 @@ export type SyncConflictResolver = (
 
 export type SyncArgs = $Exact<{
   database: Database,
-  pullChanges: SyncPullArgs => Promise<SyncPullResult>,
-  pushChanges: SyncPushArgs => Promise<void>,
+  pullChanges: (SyncPullArgs) => Promise<SyncPullResult>,
+  pushChanges?: (SyncPushArgs) => Promise<?SyncPushResult>,
   // version at which support for migration syncs was added - the version BEFORE first syncable migration
   migrationsEnabledAtVersion?: SchemaVersion,
   sendCreatedAsUpdated?: boolean,
@@ -72,87 +72,29 @@ export type SyncArgs = $Exact<{
   conflictResolver?: SyncConflictResolver,
   // commits changes in multiple batches, and not one - temporary workaround for memory issue
   _unsafeBatchPerCollection?: boolean,
+  // Advanced optimization - pullChanges must return syncJson or syncJsonId to be processed by native code.
+  // This can only be used on initial (login) sync, not for incremental syncs.
+  // This can only be used with SQLiteAdapter with JSI enabled.
+  // The exact API may change between versions of WatermelonDB.
+  // See documentation for more details.
+  unsafeTurbo?: boolean,
+  // Called after pullChanges with whatever was returned by pullChanges, minus `changes`. Useful
+  // when using turbo mode
+  onDidPullChanges?: (Object) => Promise<void>,
 }>
 
 // See Sync docs for usage details
 
-export async function synchronize({
-  database,
-  pullChanges,
-  pushChanges,
-  sendCreatedAsUpdated = false,
-  migrationsEnabledAtVersion,
-  log,
-  conflictResolver,
-  _unsafeBatchPerCollection,
-}: SyncArgs): Promise<void> {
-  ensureActionsEnabled(database)
-  const resetCount = database._resetCount
-  log && (log.startedAt = new Date())
-
-  // TODO: Wrap the three computionally intensive phases in `requestIdleCallback`
-
-  // pull phase
-  const lastPulledAt = await getLastPulledAt(database)
-  log && (log.lastPulledAt = lastPulledAt)
-
-  const { schemaVersion, migration, shouldSaveSchemaVersion } = await getMigrationInfo(
-    database,
-    log,
-    lastPulledAt,
-    migrationsEnabledAtVersion,
-  )
-
-  const { changes: remoteChanges, timestamp: newLastPulledAt } = await pullChanges({
-    lastPulledAt,
-    schemaVersion,
-    migration,
-  })
-  log && (log.newLastPulledAt = newLastPulledAt)
-  invariant(
-    typeof newLastPulledAt === 'number' && newLastPulledAt > 0,
-    `pullChanges() returned invalid timestamp ${newLastPulledAt}. timestamp must be a non-zero number`,
-  )
-
-  await database.action(async action => {
-    ensureSameDatabase(database, resetCount)
-    invariant(
-      lastPulledAt === (await getLastPulledAt(database)),
-      '[Sync] Concurrent synchronization is not allowed. More than one synchronize() call was running at the same time, and the later one was aborted before committing results to local database.',
-    )
-    await action.subAction(() =>
-      applyRemoteChanges(
-        database,
-        remoteChanges,
-        sendCreatedAsUpdated,
-        log,
-        conflictResolver,
-        _unsafeBatchPerCollection,
-      ),
-    )
-    await setLastPulledAt(database, newLastPulledAt)
-
-    if (shouldSaveSchemaVersion) {
-      await setLastPulledSchemaVersion(database, schemaVersion)
-    }
-  }, 'sync-synchronize-apply')
-
-  // push phase
-  const localChanges = await fetchLocalChanges(database)
-
-  ensureSameDatabase(database, resetCount)
-  if (!isChangeSetEmpty(localChanges.changes)) {
-    await pushChanges({ changes: localChanges.changes, lastPulledAt: newLastPulledAt })
-
-    ensureSameDatabase(database, resetCount)
-    await markLocalChangesAsSynced(database, localChanges)
+export async function synchronize(args: SyncArgs): Promise<void> {
+  try {
+    const synchronizeImpl = require('./impl/synchronize').default
+    await synchronizeImpl(args)
+  } catch (error) {
+    args.log && (args.log.error = error)
+    throw error
   }
-
-  log && (log.finishedAt = new Date())
 }
 
-export async function hasUnsyncedChanges({
-  database,
-}: $Exact<{ database: Database }>): Promise<boolean> {
-  return hasUnsyncedChangesImpl(database)
+export function hasUnsyncedChanges({ database }: $Exact<{ database: Database }>): Promise<boolean> {
+  return require('./impl').hasUnsyncedChanges(database)
 }

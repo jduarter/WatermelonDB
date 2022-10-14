@@ -121,6 +121,7 @@ const copyNonJavaScriptFiles = buildPath => {
     'README.md',
     'yarn.lock',
     'WatermelonDB.podspec',
+    'react-native.config.js',
     'docs',
     'native/shared',
     'native/ios',
@@ -142,6 +143,9 @@ if (isDevelopment) {
       buildSrcModule(file)
       buildCjsModule(file)
     } else if (file.match(/\.js$/)) {
+      fs.copySync(file, path.join(DEV_PATH, replace(SOURCE_PATH, '', file)))
+    } else if (file.match(/\.d.ts$/)) {
+      // Typescript
       fs.copySync(file, path.join(DEV_PATH, replace(SOURCE_PATH, '', file)))
     } else {
       // native files
@@ -193,6 +197,8 @@ if (isDevelopment) {
 
   // copy typescript definitions
   glob(`${SOURCE_PATH}/**/*.d.ts`, {}, (err, files) => {
-    copyFiles(DIST_PATH, files, SOURCE_PATH)
+    files.forEach(file => {
+      fs.copySync(file, path.join(DIST_PATH, replace(SOURCE_PATH, '', file)))
+    })
   })
 }
